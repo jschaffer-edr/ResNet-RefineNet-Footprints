@@ -6,23 +6,33 @@ from pathlib import Path
 from models.RefineNetLite import build_refinenet
 
 from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.losses import CategoricalCrossentropy
+#from tensorflow.keras.losses import CategoricalCrossentropy
 #from memory_saving_gradients import gradients
 #from tensorflow.keras.mixed_precision import experimental as mixed_precision
 
-#from tensorflow_large_model_support import LMS
+from tensorflow_large_model_support import LMS
 
 #from customCallbacks import OutputObserver
 
 import datetime
 
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
-from tensorflow import keras as K
-import tensorboard
+gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=0.5)
+config = tf.ConfigProto(gpu_options=gpu_options)
+config.gpu_options.allow_growth=True
+session = tf.Session(config=config)
+
+
+
+
+from tensorflow.python.keras import backend as K
+#import tensorboard
 from OutputObserver import OutputObserver
 
-import os
+#import os
+
+
 
 #os.system("capsh --print")
 
@@ -31,7 +41,7 @@ import os
 #tf.compat.v1.disable_eager_execution()
 #tf.config.experimental.set_lms_enabled(True)
 
-#tf.compat.v1.disable_v2_behavior()
+tf.disable_v2_behavior()
 
 #policy = mixed_precision.Policy('mixed_float16')
 #mixed_precision.set_policy(policy)
@@ -39,9 +49,9 @@ import os
 #tf.debugging.set_log_device_placement(True)
 
 
-gpus=tf.config.experimental.list_physical_devices('GPU')
-for gpu in gpus:
-    tf.config.experimental.set_memory_growth(gpu,True)
+#gpus=tf.config.experimental.list_physical_devices('GPU')
+#for gpu in gpus:
+#    tf.config.experimental.set_memory_growth(gpu,True)
 
 #tf.config.threading.set_inter_op_parallelism_threads(512)
 #tf.config.threading.set_intra_op_parallelism_threads(512)
@@ -95,61 +105,40 @@ def weighted_categorical_crossentropy(weights):
         Kweights = tf.constant(weights)
         if not tf.is_tensor(y_pred): y_pred = tf.constant(y_pred)
         y_true = tf.cast(y_true, y_pred.dtype)
-        return K.losses.categorical_crossentropy(y_true, y_pred, from_logits=True) * K.backend.sum(y_true *Kweights, axis=-1)
+        return K.categorical_crossentropy(y_true, y_pred, from_logits=True) * K.sum(y_true *Kweights, axis=-1)
     return wcce
 
 
 weights=[1.0,1.5,0.5]
 #model.compile(optimizer = Adam(lr = 1e-4), loss = CategoricalCrossentropy(from_logits=True), metrics = ['accuracy'])
-model.compile(optimizer = Adam(lr = 1e-4), loss=weighted_categorical_crossentropy([1.0,1.5,0.5]), metrics = ['accuracy'])
+model.compile(optimizer = Adam(lr = 1e-4), loss=weighted_categorical_crossentropy(weights), metrics = ['accuracy'])
 
 
 #, tf.keras.metrics.MeanIoU(num_classes=2)]
 
 
-log_dir = "logs/fit/" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=log_dir)
+#log_dir = "logs/fit/" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+#tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=log_dir)
 
 
 
-#lms_callback= LMS()
+lms_callback= LMS(swapout_threshold=40, swapin_ahead=3, swapin_groupby=2)
 
-#swapout_threshold=40, swapin_ahead=3, swapin_groupby=2)
-
-#lms_callback.batch_size = 1
+#lms_callback.batch_size = batch_size
 #lms_callback.run()
 
-tmp_data = next(myValGen.generator())
-save_imgs = OutputObserver(tmp_data, log_dir, class_colors)
 
 
+
+#tmp_data = next(myValGen.generator())
+#save_imgs = OutputObserver(tmp_data, log_dir, class_colors)
 
 model_checkpoint = tf.keras.callbacks.ModelCheckpoint(
     filepath='checkpoints/weights.{epoch:02d}-{val_loss:.2f}.hdf5',
     monitor='val_loss',
     verbose=1,
-    save_best_only=True
+    save_best_only=False
 )
-#print("ds_type", type(train_ds))
-
-
-import matplotlib.pyplot as plt
-
-def display(display_list):
-  plt.figure(figsize=(15, 15))
-
-  title = ['Input Image', 'True Mask', 'Predicted Mask']
-
-  for i in range(len(display_list)):
-    plt.subplot(1, len(display_list), i+1)
-    plt.title(title[i])
-    plt.imshow(tf.keras.preprocessing.image.array_to_img(display_list[i]))
-    plt.axis('off')
-  plt.show()
-
-
-#display(next(myTrainGen.generator()))
-
 
 
 model.fit(x=myTrainGen.generator(),
@@ -158,6 +147,7 @@ model.fit(x=myTrainGen.generator(),
           validation_steps = validation_images // batch_size,
           epochs = epochs,
           #class_weight= {0 : 1.0, 1 : 1.5, 2 : 0.5}, #building is base, perimeter is elevated
-          callbacks = [tensorboard_callback, model_checkpoint, save_imgs])
+          callbacks = [model_checkpoint, lms_callback])
+          #callbacks =[lms_callback])
 
 # callbacks = [model_checkpoint, tbCallBack, lrate, history, save_imgs]

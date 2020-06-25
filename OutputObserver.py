@@ -10,7 +10,7 @@ import io
 import numpy as np
 from tensorflow.keras.callbacks import Callback
 import matplotlib.pyplot as plt
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 class OutputObserver(Callback):
     """"
@@ -35,8 +35,9 @@ class OutputObserver(Callback):
 
         #logdir = "logs/train_data/" + datetime.now().strftime("%Y%m%d-%H%M%S")
         # Creates a file writer for the log directory.
-        self.file_writer = tf.summary.create_file_writer(output_path)
+        self.file_writer = tf.summary.FileWriter(output_path)
 
+        self.sess = tf.compat.v1.Session()
 
         '''
         if isinstance(data,(list,)):
@@ -89,7 +90,7 @@ class OutputObserver(Callback):
         plt.close(figure)
         buf.seek(0)
         # Convert PNG buffer to TF image
-        image = tf.image.decode_png(buf.getvalue(), channels=4)
+        image = tf.io.decode_png(buf.getvalue(), channels=4)
         # Add the batch dimension
         image = tf.expand_dims(image, 0)
         return image
@@ -122,10 +123,11 @@ class OutputObserver(Callback):
             
             
             #self.display([self.input[0], target_labelled, img]) #self.target[0],
-            fig = self.get_figure([self.input[0], target_labelled, img])
+            fig=self.get_figure([self.input[0], target_labelled, img])
 
-            with self.file_writer.as_default():
-                tf.summary.image("Training data", self.plot_to_image(fig), step=(100000*self.epoch+batch)) #step=batch
+            #with self.file_writer.as_default():
+            im_summary =tf.summary.image("Training data", self.plot_to_image(fig))# step=(100000*self.epoch+batch)) #step=batch
+            self.file_writer.add_summary(im_summary.eval(session=self.sess)) #, global_step=(1000000*self.epoch+batch)
 
             
     

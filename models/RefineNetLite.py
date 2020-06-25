@@ -68,8 +68,7 @@ def ConvUpscaleBlock(inputs, n_filters=256,  kernel_size=[3, 3], scale=2):
 
 def BilinearUpsampling(inputs, scale, method):
     if method=="nn":
-        return tf.image.resize(inputs, size=[tf.shape(input=inputs)[1]*scale,  tf.shape(input=inputs)[2]*scale], 
-method=tf.image.ResizeMethod.BILINEAR) #NEAREST_NEIGHBOR
+        return tf.image.resize(inputs, size=[tf.shape(input=inputs)[1]*scale,  tf.shape(input=inputs)[2]*scale], method=tf.image.ResizeMethod.BILINEAR) #NEAREST_NEIGHBOR
     elif method=="conv":
         net = ConvUpscaleBlock(inputs, 128, kernel_size=[3,3], scale=2)
         net = ConvBlock(net, 128)
@@ -275,8 +274,7 @@ def RefineBlock(high_inputs=None, low_inputs=None, block=0):
         return output
 
 
-def build_refinenet(input_shape, num_classes, is_training=True, frontend_trainable=False, tf_frontend=True, 
-out_logits=True, upscaling_method='nn'):
+def build_refinenet(input_shape, num_classes, is_training=True, frontend_trainable=False, tf_frontend=True, out_logits=True, upscaling_method='nn'):
     """
     Builds the RefineNet model.
 
@@ -296,7 +294,7 @@ out_logits=True, upscaling_method='nn'):
     # set the frontend and retrieve high
     frontend = None
 
-    
+    '''
     from classification_models.tfkeras import Classifiers
 
     #input_tens = tf.zeros([448,448,3])
@@ -342,7 +340,7 @@ out_logits=True, upscaling_method='nn'):
             high[5-cb] = (block_out)
 
         print(high)
-    
+    '''
     else:  # Use implementation at resnet_101.py from https://github.com/Attila94/refinenet-keras/blob/master/model/resnet_101.py
         resnet_weights = 'models/resnet101_weights_tf.h5'
 

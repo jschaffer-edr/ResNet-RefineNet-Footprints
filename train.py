@@ -1,340 +1,243 @@
-from __future__ import print_function
-import os,time, sys, math
-from cv2 import cv2
-import tensorflow as tf
-import tensorflow.contrib.slim as slim
-import numpy as np
-import time, datetime
 import argparse
-import random
-import os, sys
-import subprocess
+import os
+from datetime import datetime
+from pathlib import Path
 
-# use 'Agg' on matplotlib so that plots could be generated even without Xserver
-# running
-import matplotlib
-matplotlib.use('Agg')
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
-from utils import utils, helpers
-from builders import model_builder
+import tensorboard
+import tensorflow as tf
+from tensorflow import keras as K
+from tensorflow.keras.losses import CategoricalCrossentropy
+from tensorflow.keras.optimizers import Adam
 
-import matplotlib.pyplot as plt
+from Callbacks import OutputObserver
+from customGenerator import customGenerator
+from models.RefineNetLite import build_refinenet
+from utils.helpers import get_label_info
+from utils.logging import CsvLogger
 
-def str2bool(v):
-    if v.lower() in ('yes', 'true', 't', 'y', '1'):
-        return True
-    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
-        return False
-    else:
-        raise argparse.ArgumentTypeError('Boolean value expected.')
+
+# Tensorflow configuration
+tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
+gpus = tf.config.experimental.list_physical_devices('GPU')
+for gpu in gpus:
+    tf.config.experimental.set_memory_growth(gpu, True)
+
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--num_epochs', type=int, default=300, help='Number of epochs to train for')
-parser.add_argument('--epoch_start_i', type=int, default=0, help='Start counting epochs from this number')
-parser.add_argument('--checkpoint_step', type=int, default=5, help='How often to save checkpoints (epochs)')
-parser.add_argument('--validation_step', type=int, default=1, help='How often to perform validation (epochs)')
-parser.add_argument('--image', type=str, default=None, help='The image you want to predict on. Only valid in "predict" mode.')
-parser.add_argument('--continue_training', type=str2bool, default=False, help='Whether to continue training from a checkpoint')
-parser.add_argument('--dataset', type=str, default="CamVid", help='Dataset you are using.')
-parser.add_argument('--crop_height', type=int, default=512, help='Height of cropped input image to network')
-parser.add_argument('--crop_width', type=int, default=512, help='Width of cropped input image to network')
-parser.add_argument('--batch_size', type=int, default=1, help='Number of images in each batch')
-parser.add_argument('--num_val_images', type=int, default=20, help='The number of images to used for validations')
-parser.add_argument('--h_flip', type=str2bool, default=False, help='Whether to randomly flip the image horizontally for data augmentation')
-parser.add_argument('--v_flip', type=str2bool, default=False, help='Whether to randomly flip the image vertically for data augmentation')
-parser.add_argument('--brightness', type=float, default=None, help='Whether to randomly change the image brightness for data augmentation. Specifies the max bightness change as a factor between 0.0 and 1.0. For example, 0.1 represents a max brightness change of 10%% (+-).')
-parser.add_argument('--rotation', type=float, default=None, help='Whether to randomly rotate the image for data augmentation. Specifies the max rotation angle in degrees.')
-parser.add_argument('--model', type=str, default="FC-DenseNet56", help='The model you are using. See model_builder.py for supported models')
-parser.add_argument('--frontend', type=str, default="ResNet101", help='The frontend you are using. See frontend_builder.py for supported models')
+parser.add_argument('--continue_model', type=str, default=None,
+                    help='string of SavedModel folder e.g. \'epoch_22-val_acc_0.8959851264953613\'')
+parser.add_argument('--csv', type=str, default=None, help='path to logging csv')
+parser.add_argument('--loss', type=str, default='CCE', help='One of \'CCE\' or \'IOU\'')
 args = parser.parse_args()
 
 
-def data_augmentation(input_image, output_image):
-    # Data augmentation
-    input_image, output_image = utils.random_crop(input_image, output_image, args.crop_height, args.crop_width)
-
-    if args.h_flip and random.randint(0,1):
-        input_image = cv2.flip(input_image, 1)
-        output_image = cv2.flip(output_image, 1)
-    if args.v_flip and random.randint(0,1):
-        input_image = cv2.flip(input_image, 0)
-        output_image = cv2.flip(output_image, 0)
-    if args.brightness:
-        factor = 1.0 + random.uniform(-1.0*args.brightness, args.brightness)
-        table = np.array([((i / 255.0) * factor) * 255 for i in np.arange(0, 256)]).astype(np.uint8)
-        input_image = cv2.LUT(input_image, table)
-    if args.rotation:
-        angle = random.uniform(-1*args.rotation, args.rotation)
-    if args.rotation:
-        M = cv2.getRotationMatrix2D((input_image.shape[1]//2, input_image.shape[0]//2), angle, 1.0)
-        input_image = cv2.warpAffine(input_image, M, (input_image.shape[1], input_image.shape[0]), flags=cv2.INTER_NEAREST)
-        output_image = cv2.warpAffine(output_image, M, (output_image.shape[1], output_image.shape[0]), flags=cv2.INTER_NEAREST)
+# Data configuration
+dataset_basepath = Path("/media/jetson/Samsung500GB/SpaceNet/")
+if args.loss == 'CCE':
+    dataset_basepath = dataset_basepath / '3class'
+else:
+    dataset_basepath = dataset_basepath / '2class'
 
-    return input_image, output_image
-
-
-# Get the names of the classes so we can record the evaluation results
-class_names_list, label_values = helpers.get_label_info(os.path.join(args.dataset, "class_dict.csv"))
-class_names_string = ""
-for class_name in class_names_list:
-    if not class_name == class_names_list[-1]:
-        class_names_string = class_names_string + class_name + ", "
-    else:
-        class_names_string = class_names_string + class_name
+train_images = dataset_basepath / 'train'
+train_masks = dataset_basepath / 'train_labels'
+val_images = dataset_basepath / 'val'
+val_masks = dataset_basepath / 'val_labels'
+class_dict = dataset_basepath / 'class_dict.csv'
 
-num_classes = len(label_values)
-
-config = tf.ConfigProto()
-config.gpu_options.allow_growth = True
-sess=tf.Session(config=config)
+class_labels, class_colors, num_classes = get_label_info(
+    dataset_basepath / "class_dict.csv")
 
+print("num classes,", num_classes)
 
-# Compute your softmax cross entropy loss
-net_input = tf.placeholder(tf.float32,shape=[None,None,None,3])
-net_output = tf.placeholder(tf.float32,shape=[None,None,None,num_classes])
-
-network, init_fn = model_builder.build_model(model_name=args.model, frontend=args.frontend, net_input=net_input, num_classes=num_classes, crop_width=args.crop_width, crop_height=args.crop_height, is_training=True)
-
-loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(logits=network, labels=net_output))
-
-opt = tf.train.RMSPropOptimizer(learning_rate=0.0001, decay=0.995).minimize(loss, var_list=[var for var in tf.trainable_variables()])
-
-saver=tf.train.Saver(max_to_keep=1000)
-sess.run(tf.global_variables_initializer())
-
-utils.count_params()
-
-# If a pre-trained ResNet is required, load the weights.
-# This must be done AFTER the variables are initialized with sess.run(tf.global_variables_initializer())
-if init_fn is not None:
-    init_fn(sess)
-
-# Load a previous checkpoint if desired
-model_checkpoint_name = "checkpoints/latest_model_" + args.model + "_" + args.dataset + ".ckpt"
-if args.continue_training:
-    print('Loaded latest model checkpoint')
-    saver.restore(sess, model_checkpoint_name)
-
-# Load the data
-print("Loading the data ...")
-train_input_names,train_output_names, val_input_names, val_output_names, test_input_names, test_output_names = utils.prepare_data(dataset_dir=args.dataset)
-
-
-
-print("\n***** Begin training *****")
-print("Dataset -->", args.dataset)
-print("Model -->", args.model)
-print("Crop Height -->", args.crop_height)
-print("Crop Width -->", args.crop_width)
-print("Num Epochs -->", args.num_epochs)
-print("Batch Size -->", args.batch_size)
-print("Num Classes -->", num_classes)
-
-print("Data Augmentation:")
-print("\tVertical Flip -->", args.v_flip)
-print("\tHorizontal Flip -->", args.h_flip)
-print("\tBrightness Alteration -->", args.brightness)
-print("\tRotation -->", args.rotation)
-print("")
+print("labels", class_labels)
 
-avg_loss_per_epoch = []
-avg_scores_per_epoch = []
-avg_iou_per_epoch = []
+print("class_colors", class_colors)
 
-# Which validation images do we want
-val_indices = []
-num_vals = min(args.num_val_images, len(val_input_names))
 
-# Set random seed to make sure models are validated on the same validation images.
-# So you can compare the results of different models more intuitively.
-random.seed(16)
-val_indices=random.sample(range(0,len(val_input_names)),num_vals)
+input_shape = (650, 650, 3)
+random_crop = (256, 256, 3)
+batch_size = 2
+epochs = 200
+validation_images = 100
 
-# Do the training here
-for epoch in range(args.epoch_start_i, args.num_epochs):
 
-    current_losses = []
+myTrainGen = customGenerator(batch_size, train_images, train_masks,
+                             num_classes, input_shape, dict(), class_colors, random_crop=random_crop)
+myValGen = customGenerator(batch_size, val_images, val_masks, num_classes,
+                           input_shape, dict(), class_colors, random_crop=random_crop)
 
-    cnt=0
+train_ds = tf.data.Dataset.from_generator(
+    myTrainGen.generator, (tf.float32, tf.float32)).prefetch(tf.data.experimental.AUTOTUNE)
+val_ds = tf.data.Dataset.from_generator(
+    myTrainGen.generator, (tf.float32, tf.float32)).prefetch(tf.data.experimental.AUTOTUNE)
 
-    # Equivalent to shuffling
-    id_list = np.random.permutation(len(train_input_names))
+steps_per_epoch = myTrainGen.num_samples // batch_size
 
-    num_iters = int(np.floor(len(id_list) / args.batch_size))
-    st = time.time()
-    epoch_st=time.time()
-    for i in range(num_iters):
-        # st=time.time()
 
-        input_image_batch = []
-        output_image_batch = []
+# adjust network input for random cropping
+input_shape = random_crop if random_crop else input_shape
 
-        # Collect a batch of images
-        for j in range(args.batch_size):
-            index = i*args.batch_size + j
-            id = id_list[index]
-            input_image = utils.load_image(train_input_names[id])
-            output_image = utils.load_image(train_output_names[id])
 
-            with tf.device('/cpu:0'):
-                input_image, output_image = data_augmentation(input_image, output_image)
+# load model
+start_epoch = 0
+model = None
+if args.continue_model is not None:
+    model = tf.keras.models.load_model(
+        "saved_models/{}".format(args.continue_model))  # , compile=False)
+    start_epoch = int(args.continue_model[6:8]) + 1
+else:
+    model = build_refinenet(input_shape, num_classes)
 
+def loss_iou(y, logits):
+    ''' 
+    differentiable approximation of intersection over union by Y.Wang et al
+    works only for binary segmentation
+    '''
+    #inputs have dimension [batch x height x width x 2] for building/background
+    y = tf.reshape(y[:,:,:,0], [-1])
+    logits = tf.reshape(logits[:,:,:,0], [-1])
 
-                # Prep the data. Make sure the labels are in one-hot format
-                input_image = np.float32(input_image) / 255.0
-                output_image = np.float32(helpers.one_hot_it(label=output_image, label_values=label_values))
+    inter=tf.math.reduce_sum(tf.math.multiply(logits, y))
 
-                input_image_batch.append(np.expand_dims(input_image, axis=0))
-                output_image_batch.append(np.expand_dims(output_image, axis=0))
+    union = tf.math.reduce_sum(tf.math.subtract(tf.math.add(logits, y), tf.math.multiply(logits,y)))
 
-        if args.batch_size == 1:
-            input_image_batch = input_image_batch[0]
-            output_image_batch = output_image_batch[0]
-        else:
-            input_image_batch = np.squeeze(np.stack(input_image_batch, axis=1))
-            output_image_batch = np.squeeze(np.stack(output_image_batch, axis=1))
+    loss = tf.math.subtract(tf.constant(1.0, dtype=tf.float32),tf.math.divide(inter,union))
 
-        # Do the training
-        _,current=sess.run([opt,loss],feed_dict={net_input:input_image_batch,net_output:output_image_batch})
-        current_losses.append(current)
-        cnt = cnt + args.batch_size
-        if cnt % 20 == 0:
-            string_print = "Epoch = %d Count = %d Current_Loss = %.4f Time = %.2f"%(epoch,cnt,current,time.time()-st)
-            utils.LOG(string_print)
-            st = time.time()
-
-    mean_loss = np.mean(current_losses)
-    avg_loss_per_epoch.append(mean_loss)
+    return loss
 
-    # Create directories if needed
-    if not os.path.isdir("%s/%04d"%("checkpoints",epoch)):
-        os.makedirs("%s/%04d"%("checkpoints",epoch))
+def weighted_categorical_crossentropy(weights):
+    def wcce(y_true, y_pred):
+        Kweights = tf.constant(weights)
+        if not tf.is_tensor(y_pred):
+            y_pred = tf.constant(y_pred)
+        y_true = tf.cast(y_true, y_pred.dtype)
+        return K.losses.categorical_crossentropy(y_true, y_pred, from_logits=True) * K.backend.sum(y_true * Kweights, axis=-1)
+    return wcce
 
-    # Save latest checkpoint to same file name
-    print("Saving latest checkpoint")
-    saver.save(sess,model_checkpoint_name)
 
-    if val_indices != 0 and epoch % args.checkpoint_step == 0:
-        print("Saving checkpoint for this epoch")
-        saver.save(sess,"%s/%04d/model.ckpt"%("checkpoints",epoch))
+log_dir = "logs/fit/" + datetime.now().strftime("%Y%m%d-%H%M%S")
+tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=log_dir)
 
+csv_logger = CsvLogger(args.csv)
 
-    if epoch % args.validation_step == 0:
-        print("Performing validation")
-        target=open("%s/%04d/val_scores.csv"%("checkpoints",epoch),'w')
-        target.write("val_name, avg_accuracy, precision, recall, f1 score, mean iou, %s\n" % (class_names_string))
+# Instantiate an optimizer.
+optimizer = tf.keras.optimizers.Adam(learning_rate=1e-3)
+# Instantiate a loss function.
+loss_fn = None
+if args.loss == 'CCE':
+    loss_fn = tf.keras.losses.CategoricalCrossentropy(from_logits=True)
+else:
+    loss_fn = loss_iou
 
 
-        scores_list = []
-        class_scores_list = []
-        precision_list = []
-        recall_list = []
-        f1_list = []
-        iou_list = []
 
+# Prepare the metrics.
+train_loss_metric = tf.keras.metrics.Mean('train_loss', dtype=tf.float32)
+train_acc_metric = tf.keras.metrics.CategoricalAccuracy('train_acc')
 
-        # Do the validation on a small set of validation images
-        for ind in val_indices:
+val_loss_metric = tf.keras.metrics.Mean('val_loss', dtype=tf.float32)
+val_acc_metric = tf.keras.metrics.CategoricalAccuracy('val_acc')
+val_iou_metric = tf.keras.metrics.MeanIoU(num_classes=num_classes)
 
-            input_image = np.expand_dims(np.float32(utils.load_image(val_input_names[ind])[:args.crop_height, :args.crop_width]),axis=0)/255.0
-            gt = utils.load_image(val_output_names[ind])[:args.crop_height, :args.crop_width]
-            gt = helpers.reverse_one_hot(helpers.one_hot_it(gt, label_values))
 
-            # st = time.time()
+tmp_data = next(myValGen.generator())
+save_imgs = OutputObserver(tmp_data, log_dir, class_colors)
+save_imgs.model = model
 
-            output_image = sess.run(network,feed_dict={net_input:input_image})
 
+@tf.function
+def train_step(x, y):
+    with tf.GradientTape() as tape:
+        logits = model(x, training=True)
+        loss_value = loss_fn(y, logits)
+    grads = tape.gradient(loss_value, model.trainable_weights)
+    optimizer.apply_gradients(zip(grads, model.trainable_weights))
 
-            output_image = np.array(output_image[0,:,:,:])
-            output_image = helpers.reverse_one_hot(output_image)
-            out_vis_image = helpers.colour_code_segmentation(output_image, label_values)
+    train_loss_metric(loss_value)
+    train_acc_metric.update_state(y, logits)
+    return train_loss_metric.result()
 
-            accuracy, class_accuracies, prec, rec, f1, iou = utils.evaluate_segmentation(pred=output_image, label=gt, num_classes=num_classes)
 
-            file_name = utils.filepath_to_name(val_input_names[ind])
-            target.write("%s, %f, %f, %f, %f, %f"%(file_name, accuracy, prec, rec, f1, iou))
-            for item in class_accuracies:
-                target.write(", %f"%(item))
-            target.write("\n")
+@tf.function
+def test_step(x, y):
+    val_logits = model(x, training=False)  # model.predict(x) #
+    loss_value = loss_fn(y, val_logits)
 
-            scores_list.append(accuracy)
-            class_scores_list.append(class_accuracies)
-            precision_list.append(prec)
-            recall_list.append(rec)
-            f1_list.append(f1)
-            iou_list.append(iou)
+    val_loss_metric(loss_value)
+    val_acc_metric.update_state(y, val_logits)
 
-            gt = helpers.colour_code_segmentation(gt, label_values)
+    print("y shape", tf.keras.backend.int_shape(y))
+    print("logits shape", tf.keras.backend.int_shape(val_logits))
+    print("argmax shape", tf.keras.backend.int_shape(val_logits))
+    val_iou_metric.update_state(
+        y, tf.keras.backend.softmax(val_logits, axis=-1))
 
-            file_name = os.path.basename(val_input_names[ind])
-            file_name = os.path.splitext(file_name)[0]
-            cv2.imwrite("%s/%04d/%s_pred.png"%("checkpoints",epoch, file_name),cv2.cvtColor(np.uint8(out_vis_image), cv2.COLOR_RGB2BGR))
-            cv2.imwrite("%s/%04d/%s_gt.png"%("checkpoints",epoch, file_name),cv2.cvtColor(np.uint8(gt), cv2.COLOR_RGB2BGR))
 
 
-        target.close()
+start = datetime.utcnow()
 
-        avg_score = np.mean(scores_list)
-        class_avg_scores = np.mean(class_scores_list, axis=0)
-        avg_scores_per_epoch.append(avg_score)
-        avg_precision = np.mean(precision_list)
-        avg_recall = np.mean(recall_list)
-        avg_f1 = np.mean(f1_list)
-        avg_iou = np.mean(iou_list)
-        avg_iou_per_epoch.append(avg_iou)
+writer = tf.summary.create_file_writer(log_dir)
 
-        print("\nAverage validation accuracy for epoch # %04d = %f"% (epoch, avg_score))
-        print("Average per class validation accuracies for epoch # %04d:"% (epoch))
-        for index, item in enumerate(class_avg_scores):
-            print("%s = %f" % (class_names_list[index], item))
-        print("Validation precision = ", avg_precision)
-        print("Validation recall = ", avg_recall)
-        print("Validation F1 score = ", avg_f1)
-        print("Validation IoU score = ", avg_iou)
 
-    epoch_time=time.time()-epoch_st
-    remain_time=epoch_time*(args.num_epochs-1-epoch)
-    m, s = divmod(remain_time, 60)
-    h, m = divmod(m, 60)
-    if s!=0:
-        train_time="Remaining training time = %d hours %d minutes %d seconds\n"%(h,m,s)
-    else:
-        train_time="Remaining training time : Training completed.\n"
-    utils.LOG(train_time)
-    scores_list = []
+#start_epoch = 180
 
+for epoch in range(start_epoch, epochs):
+    print("\nStart of epoch %d" % (epoch,))
 
-    fig1, ax1 = plt.subplots(figsize=(11, 8))
+    # Iterate over the batches of the dataset.
+    for step, (x_batch_train, y_batch_train) in enumerate(train_ds):  # (myTrainGen.generator()
 
-    ax1.plot(range(epoch+1), avg_scores_per_epoch)
-    ax1.set_title("Average validation accuracy vs epochs")
-    ax1.set_xlabel("Epoch")
-    ax1.set_ylabel("Avg. val. accuracy")
+        loss_value = train_step(x_batch_train, y_batch_train)
 
+        # Log every 100 batches.
+        if step % 100 == 0:
 
-    plt.savefig('accuracy_vs_epochs.png')
+            #save_imgs.on_batch_end(step, epoch)
 
-    plt.clf()
+            print(
+                "Step %d / %d: train_loss=%.4f"
+                % (step, steps_per_epoch, float(loss_value))
+            )
+            temp = datetime.utcnow()
+            print("frames/second: {}".format(200/(temp-start).total_seconds()))
+            start = temp
 
-    fig2, ax2 = plt.subplots(figsize=(11, 8))
+        if step == steps_per_epoch:
+            # Display metrics at the end of each epoch.
+            train_acc = train_acc_metric.result()
+            train_loss = train_loss_metric.result()
+            print("Epoch %d: train_acc=%.4f train_loss=%.4f" %
+                  (epoch, float(train_acc), float(train_loss)))
 
-    ax2.plot(range(epoch+1), avg_loss_per_epoch)
-    ax2.set_title("Average loss vs epochs")
-    ax2.set_xlabel("Epoch")
-    ax2.set_ylabel("Current loss")
+            # Reset training metrics at the end of each epoch
+            train_acc_metric.reset_states()
+            train_loss_metric.reset_states()
 
-    plt.savefig('loss_vs_epochs.png')
+            # Run a validation loop at the end of each epoch.
+            for x_batch_val, y_batch_val in val_ds.take(validation_images):
+                test_step(x_batch_val, y_batch_val)
 
-    plt.clf()
+            val_acc = val_acc_metric.result()
+            val_loss = val_loss_metric.result()
+            val_iou = val_iou_metric.result()
 
-    fig3, ax3 = plt.subplots(figsize=(11, 8))
+            val_acc_metric.reset_states()
+            val_loss_metric.reset_states()
+            val_iou_metric.reset_states()
+            print("val_acc=%.4f val_loss=%.4f val_iou=%.4f" %
+                  (float(val_acc), float(val_loss), float(val_iou)))
 
-    ax3.plot(range(epoch+1), avg_iou_per_epoch)
-    ax3.set_title("Average IoU vs epochs")
-    ax3.set_xlabel("Epoch")
-    ax3.set_ylabel("Current IoU")
+            # with writer.as_default():
+            #    tf.summary.scalar("val_acc_epoch", val_acc, step=epoch)
+            #    tf.summary.scalar("train_acc_epoch", train_acc, step=epoch)
 
-    plt.savefig('iou_vs_epochs.png')
+            csv_logger.writeEpoch(epoch, float(train_loss), float(train_acc), float(val_loss), float(val_acc), float(val_iou))
 
-
-
+            print("Saving model...")
+            save_start = datetime.utcnow()
+            model.save('saved_models/epoch_%d-acc_%.4f-loss_%.4f-iou_%.4f' % (epoch, float(val_acc), float(val_loss), float(val_iou)))
+            print("Model saved in {} seconds".format((datetime.utcnow()-save_start).total_seconds()))
+            
+            break
